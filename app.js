@@ -29,8 +29,22 @@ function loadState() {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && Array.isArray(parsed.players) && Array.isArray(parsed.tournaments)) {
-        // Migrate old tournaments without `format`
-        parsed.tournaments.forEach(t => { if (!t.format) t.format = '1v1'; });
+        parsed.tournaments.forEach(t => {
+          if (!t.format) t.format = '1v1';
+          // Migrate old fixed-teams 2v2 knockout → schedule-based
+          const isOldFixed = t.format === '2v2' && t.type === 'knockout' &&
+            (t.teams || t.matches.some(m => m.from || m.isBye || (m.teamA && !Array.isArray(m.teamA))));
+          if (isOldFixed) {
+            t.matches = generateRoundRobin2v2(t.players);
+            delete t.teams;
+            delete t.reserve;
+          }
+        });
+        // Drop stale draft fields from older versions
+        if (parsed.setupDraft) {
+          delete parsed.setupDraft.knockoutTeams;
+          delete parsed.setupDraft.knockoutReserve;
+        }
         return {
           players: parsed.players,
           tournaments: parsed.tournaments,
@@ -195,100 +209,6 @@ function generateRoundRobin2v2(players) {
   return matches;
 }
 
-function generateRandomTeams(players) {
-  const shuffled = shuffle(players);
-  const teams = [];
-  for (let i = 0; i + 1 < shuffled.length; i += 2) {
-    teams.push({ id: uid(), name: '', players: [shuffled[i], shuffled[i + 1]] });
-  }
-  const reserve = shuffled.length % 2 === 1 ? shuffled[shuffled.length - 1] : null;
-  return { teams, reserve };
-}
-
-function sameTeam(a, b) {
-  if (a === b) return true;
-  if (!a || !b) return false;
-  if (a.id && b.id) return a.id === b.id;
-  return false;
-}
-
-function teamPlayers(team) {
-  if (!team) return [];
-  return team.players || [];
-}
-
-function teamDisplayName(team, fallbackIdx) {
-  if (!team) return '';
-  if (team.name && team.name.trim()) return team.name.trim();
-  if (fallbackIdx != null) return `Komanda ${fallbackIdx}`;
-  return (team.players || []).join(' + ');
-}
-
-function generateKnockout2v2(teams) {
-  const shuffled = shuffle(teams);
-  let bracketSize = 1;
-  while (bracketSize < shuffled.length) bracketSize *= 2;
-  const slots = shuffled.slice();
-  while (slots.length < bracketSize) slots.push(null);
-
-  const matches = [];
-  let prevRoundIds = [];
-  let roundNum = 1;
-
-  for (let i = 0; i < bracketSize; i += 2) {
-    const tA = slots[i], tB = slots[i + 1];
-    const isBye = tA === null || tB === null;
-    const winner = isBye ? (tA || tB) : null;
-    const m = {
-      id: uid(),
-      round: 1,
-      teamA: tA,
-      teamB: tB,
-      scoreA: null,
-      scoreB: null,
-      winner,
-      isBye,
-      from: null,
-    };
-    matches.push(m);
-    prevRoundIds.push(m.id);
-  }
-
-  while (prevRoundIds.length > 1) {
-    roundNum++;
-    const nextIds = [];
-    for (let i = 0; i < prevRoundIds.length; i += 2) {
-      const fromA = matches.find(x => x.id === prevRoundIds[i]);
-      const fromB = matches.find(x => x.id === prevRoundIds[i + 1]);
-      const m = {
-        id: uid(),
-        round: roundNum,
-        teamA: fromA.winner || null,
-        teamB: fromB.winner || null,
-        scoreA: null,
-        scoreB: null,
-        winner: null,
-        isBye: false,
-        from: [fromA.id, fromB.id],
-      };
-      matches.push(m);
-      nextIds.push(m.id);
-    }
-    prevRoundIds = nextIds;
-  }
-
-  matches.forEach(m => {
-    if (m.from) {
-      const a = matches.find(x => x.id === m.from[0]);
-      const b = matches.find(x => x.id === m.from[1]);
-      m.teamA = a.winner;
-      m.teamB = b.winner;
-    }
-  });
-
-  return matches;
-}
-
 function generateKnockout1v1(players) {
   const shuffled = shuffle(players);
   let bracketSize = 1;
@@ -443,61 +363,31 @@ function knockoutRoundLabel(roundIdx, totalRounds) {
 function knockoutPropagate(tournament, matchId) {
   const m = tournament.matches.find(x => x.id === matchId);
   if (!m) return;
-  const is2v2 = tournament.format === '2v2';
 
-  if (is2v2) {
-    if (m.scoreA != null && m.scoreB != null && m.scoreA !== m.scoreB) {
-      m.winner = m.scoreA > m.scoreB ? m.teamA : m.teamB;
-    } else {
-      m.winner = null;
-    }
+  if (m.score1 != null && m.score2 != null && m.score1 !== m.score2) {
+    m.winner = m.score1 > m.score2 ? m.player1 : m.player2;
   } else {
-    if (m.score1 != null && m.score2 != null && m.score1 !== m.score2) {
-      m.winner = m.score1 > m.score2 ? m.player1 : m.player2;
-    } else {
-      m.winner = null;
-    }
+    m.winner = null;
   }
 
   const dependent = tournament.matches.find(x => x.from && x.from.includes(m.id));
   if (!dependent) return;
   const idx = dependent.from.indexOf(m.id);
-
-  if (is2v2) {
-    const oldTeam = idx === 0 ? dependent.teamA : dependent.teamB;
-    const newTeam = m.winner;
-    if (!sameTeam(oldTeam, newTeam)) {
-      if (idx === 0) dependent.teamA = newTeam;
-      else dependent.teamB = newTeam;
-      dependent.scoreA = null;
-      dependent.scoreB = null;
-      dependent.winner = null;
-      knockoutPropagate(tournament, dependent.id);
-    }
-  } else {
-    const oldPlayer = idx === 0 ? dependent.player1 : dependent.player2;
-    const newPlayer = m.winner;
-    if (oldPlayer !== newPlayer) {
-      if (idx === 0) dependent.player1 = newPlayer;
-      else dependent.player2 = newPlayer;
-      dependent.score1 = null;
-      dependent.score2 = null;
-      dependent.winner = null;
-      knockoutPropagate(tournament, dependent.id);
-    }
+  const oldPlayer = idx === 0 ? dependent.player1 : dependent.player2;
+  const newPlayer = m.winner;
+  if (oldPlayer !== newPlayer) {
+    if (idx === 0) dependent.player1 = newPlayer;
+    else dependent.player2 = newPlayer;
+    dependent.score1 = null;
+    dependent.score2 = null;
+    dependent.winner = null;
+    knockoutPropagate(tournament, dependent.id);
   }
 }
 
 function knockoutChampion(tournament) {
   const last = [...tournament.matches].sort((a, b) => b.round - a.round)[0];
   return last && last.winner ? last.winner : null;
-}
-
-function teamLabel(team) {
-  if (!team) return '';
-  if (Array.isArray(team)) return team.join(' + ');
-  if (team.name && team.name.trim()) return team.name.trim();
-  return (team.players || []).join(' + ');
 }
 
 // ─── DOM utilities ───────────────────────────────────────────────────────────
@@ -656,35 +546,23 @@ function renderSetupPanel() {
   const minForFormat = FORMATS[draft.format].minPlayers;
   const enoughPlayers = draft.selectedPlayers.length >= minForFormat;
 
-  // For knockout 2v2: maintain auto-generated team list synced with selection
-  if (draft.type === 'knockout' && draft.format === '2v2') {
-    const selSet = new Set(draft.selectedPlayers);
-    const teamFlat = (draft.knockoutTeams || []).flatMap(t => t.players || []);
-    const reserveOK = !draft.knockoutReserve || selSet.has(draft.knockoutReserve);
-    const teamsOK = teamFlat.every(p => selSet.has(p)) && (teamFlat.length + (draft.knockoutReserve ? 1 : 0)) === draft.selectedPlayers.length;
-    if (!draft.knockoutTeams || !teamsOK || !reserveOK) {
-      const { teams, reserve } = generateRandomTeams(draft.selectedPlayers);
-      draft.knockoutTeams = teams;
-      draft.knockoutReserve = reserve;
-    }
-  }
-
   // Info
   let info = '';
-  if (draft.type === 'round-robin' && draft.format === '2v2') {
+  if (draft.format === '2v2') {
     const n = draft.selectedPlayers.length;
     const totalPairs = n >= 2 ? (n * (n - 1)) / 2 : 0;
     const estMatches = Math.ceil(totalPairs / 2);
+    const modeLabel = draft.type === 'knockout' ? '2v2 — uduzan çıxır (xal yox)' : '2v2 — xal sistemi';
     info = `
       <div class="flex flex-col gap-1">
         <div class="flex items-center gap-2 flex-wrap">
-          <span class="label-pill green">2v2 — hər kəs hər kəslə</span>
+          <span class="label-pill green">${modeLabel}</span>
           <span class="text-zinc-400">${n} oyuncu</span>
           <span class="text-zinc-700">·</span>
           <span class="text-zinc-400">~${estMatches} oyun</span>
           ${n > 4 ? `<span class="text-zinc-700">·</span><span class="text-amber-300/80">hər oyunda ${n - 4} nəfər dincələcək</span>` : ''}
         </div>
-        <div class="text-xs text-zinc-500">Sistem elə böləcək ki hər oyuncu digər ${n - 1} nəfərlə həm partnyor, həm rəqib olsun.</div>
+        <div class="text-xs text-zinc-500">Hər oyunda komandalar random bölünəcək. Hər oyuncu digər ${n - 1} nəfərlə həm partnyor, həm rəqib olacaq.</div>
       </div>
     `;
   } else if (draft.type === 'round-robin' && draft.format === '1v1') {
@@ -697,21 +575,6 @@ function renderSetupPanel() {
         <span class="text-zinc-700">·</span>
         <span class="text-zinc-400">${total} oyun</span>
         ${n % 2 === 1 ? `<span class="text-zinc-700">·</span><span class="text-amber-300/80">tək saydır — hər turda 1 nəfər istirahət edir</span>` : ''}
-      </div>
-    `;
-  } else if (draft.type === 'knockout' && draft.format === '2v2') {
-    const teamCount = draft.knockoutTeams?.length || 0;
-    let bs = 1; while (bs < teamCount) bs *= 2;
-    let r = 0, x = bs; while (x > 1) { x /= 2; r++; }
-    const byes = Math.max(0, bs - teamCount);
-    info = `
-      <div class="flex items-center gap-2 flex-wrap">
-        <span class="label-pill green">2v2 — uduzan komanda çıxır</span>
-        <span class="text-zinc-400">${teamCount} komanda</span>
-        ${draft.knockoutReserve ? `<span class="text-zinc-700">·</span><span class="text-amber-300/80">ehtiyat: ${escapeHtml(draft.knockoutReserve)}</span>` : ''}
-        <span class="text-zinc-700">·</span>
-        <span class="text-zinc-400">${r} tur</span>
-        ${byes > 0 ? `<span class="text-zinc-700">·</span><span class="text-amber-300/80">${byes} bye</span>` : ''}
       </div>
     `;
   } else {
@@ -796,46 +659,6 @@ function renderSetupPanel() {
             </div>
           </div>
 
-          ${draft.type === 'knockout' && draft.format === '2v2' && enoughPlayers ? `
-          <div>
-            <div class="flex items-center justify-between mb-2">
-              <label class="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Komandalar</label>
-              <button id="reshuffleTeamsBtn" type="button" class="text-xs text-emerald-400 hover:text-emerald-300">🎲 Yenidən böl</button>
-            </div>
-            <p class="text-xs text-zinc-500 mb-2">Komanda adını qeyd et — sonrakı oyunlarda istifadə edə bilərsən.</p>
-            <div class="grid sm:grid-cols-2 gap-2">
-              ${(draft.knockoutTeams || []).map((t, i) => `
-                <div class="card-tight rounded-lg bg-zinc-900/50 border border-zinc-800 flex flex-col gap-2">
-                  <div class="flex items-center gap-2">
-                    <span class="text-xs font-bold text-zinc-500 w-5">${i + 1}.</span>
-                    <input type="text" class="input team-name-input" data-team-idx="${i}" value="${escapeHtml(t.name || '')}" placeholder="Komanda ${i + 1}" autocomplete="off" />
-                  </div>
-                  <div class="flex flex-col gap-1 pl-7">
-                    ${(t.players || []).map(p => `
-                      <span class="inline-flex items-center gap-2 text-sm">
-                        <span class="avatar-mini">${escapeHtml(initials(p))}</span>
-                        <span class="font-medium">${escapeHtml(p)}</span>
-                      </span>
-                    `).join('')}
-                  </div>
-                </div>
-              `).join('')}
-              ${draft.knockoutReserve ? `
-                <div class="card-tight rounded-lg bg-amber-950/20 border border-amber-900/40 flex items-center gap-3">
-                  <span class="text-xs font-bold text-amber-400/80 w-5">↻</span>
-                  <div class="flex flex-col gap-1 flex-1">
-                    <span class="inline-flex items-center gap-2 text-sm">
-                      <span class="avatar-mini" style="background:rgba(251,191,36,0.18); color:rgb(252 211 77);">${escapeHtml(initials(draft.knockoutReserve))}</span>
-                      <span class="font-medium">${escapeHtml(draft.knockoutReserve)}</span>
-                      <span class="text-xs text-zinc-500">(ehtiyat)</span>
-                    </span>
-                  </div>
-                </div>
-              ` : ''}
-            </div>
-          </div>
-          ` : ''}
-
           <div class="card-tight rounded-lg bg-zinc-900/50 border border-zinc-800 text-sm">
             ${info}
             ${!enoughPlayers ? `<div class="mt-2 text-amber-300/80 text-xs">Bu format üçün ən az ${minForFormat} oyuncu lazımdır.</div>` : ''}
@@ -860,24 +683,6 @@ function renderSetupPanel() {
       draft.type = el.dataset.type;
       saveState();
       renderSetupPanel();
-    });
-  });
-
-  $('#reshuffleTeamsBtn')?.addEventListener('click', () => {
-    const { teams, reserve } = generateRandomTeams(draft.selectedPlayers);
-    draft.knockoutTeams = teams;
-    draft.knockoutReserve = reserve;
-    saveState();
-    renderSetupPanel();
-  });
-
-  $$('.team-name-input').forEach(input => {
-    input.addEventListener('input', e => {
-      const idx = parseInt(input.dataset.teamIdx, 10);
-      if (draft.knockoutTeams && draft.knockoutTeams[idx]) {
-        draft.knockoutTeams[idx].name = e.target.value;
-        saveState();
-      }
     });
   });
 
@@ -922,20 +727,10 @@ function renderSetupPanel() {
     if (draft.selectedPlayers.length < FORMATS[draft.format].minPlayers) return;
     const name = (draft.name || '').trim() || defaultTournamentName(draft.type, draft.format);
     let matches;
-    let teams = null;
-    let reserve = null;
-    if (draft.type === 'round-robin' && draft.format === '2v2') {
+    if (draft.format === '2v2') {
       matches = generateRoundRobin2v2(draft.selectedPlayers);
     } else if (draft.type === 'round-robin') {
       matches = generateRoundRobin1v1(draft.selectedPlayers);
-    } else if (draft.type === 'knockout' && draft.format === '2v2') {
-      teams = (draft.knockoutTeams || []).map(t => ({
-        id: t.id,
-        name: (t.name || '').trim(),
-        players: t.players.slice(),
-      }));
-      reserve = draft.knockoutReserve;
-      matches = generateKnockout2v2(teams);
     } else {
       matches = generateKnockout1v1(draft.selectedPlayers);
     }
@@ -945,8 +740,6 @@ function renderSetupPanel() {
       type: draft.type,
       format: draft.format,
       players: [...draft.selectedPlayers],
-      teams,
-      reserve,
       matches,
       createdAt: Date.now(),
     };
@@ -1003,7 +796,7 @@ function renderActivePanel() {
             <p class="section-sub">Yaradılıb: ${formatDate(current.createdAt)}</p>
           </div>
           <div class="flex items-center gap-2">
-            ${current.type === 'round-robin' && current.format === '2v2' ? `<button class="btn btn-secondary" id="reshuffleBtn">🎲 Yenidən bölüşdür</button>` : ''}
+            ${current.format === '2v2' ? `<button class="btn btn-secondary" id="reshuffleBtn">🎲 Yenidən bölüşdür</button>` : ''}
             <button class="btn btn-secondary" id="resetTournamentBtn">Nəticələri sıfırla</button>
             <button class="btn btn-danger" id="deleteTournamentBtn">Sil</button>
           </div>
@@ -1025,7 +818,7 @@ function renderActivePanel() {
         ` : ''}
       </div>
 
-      ${current.type === 'round-robin' ? renderRoundRobinView(current) : renderKnockoutView(current)}
+      ${current.format === '2v2' ? render2v2View(current) : (current.type === 'round-robin' ? renderRoundRobinView(current) : renderKnockoutView(current))}
     </div>
   `;
 
@@ -1045,15 +838,12 @@ function renderActivePanel() {
       } else {
         m.score1 = null; m.score2 = null;
       }
-      if (current.type === 'knockout') {
+      if (current.type === 'knockout' && current.format !== '2v2') {
         if (!m.isBye) m.winner = null;
-        if (m.from) {
-          if (current.format === '2v2') { m.teamA = null; m.teamB = null; }
-          else { m.player1 = null; m.player2 = null; }
-        }
+        if (m.from) { m.player1 = null; m.player2 = null; }
       }
     });
-    if (current.type === 'knockout') {
+    if (current.type === 'knockout' && current.format !== '2v2') {
       current.matches.filter(m => m.round === 1).forEach(m => knockoutPropagate(current, m.id));
     }
     saveState();
@@ -1135,7 +925,7 @@ function renderRoundRobinView(t) {
   `;
 }
 
-function renderStandingsRows(standings) {
+function renderStandingsRows(standings, showPoints = true) {
   return standings.map((s, i) => `
     <tr class="top-${i + 1}">
       <td class="pos">${i + 1}</td>
@@ -1152,7 +942,7 @@ function renderStandingsRows(standings) {
       <td>${s.gf}</td>
       <td>${s.ga}</td>
       <td>${s.gd > 0 ? '+' + s.gd : s.gd}</td>
-      <td class="pts">${s.pts}</td>
+      ${showPoints ? `<td class="pts">${s.pts}</td>` : ''}
     </tr>
   `).join('');
 }
@@ -1254,32 +1044,88 @@ function renderMatch2v2(t, m, num) {
   `;
 }
 
-// ─── Knockout view ───────────────────────────────────────────────────────────
+// ─── 2v2 view (round-robin AND knockout share the same schedule) ────────────
+function render2v2View(t) {
+  const standings = computeStandings(t);
+  const playedCount = t.matches.filter(m => isMatchPlayed(t, m)).length;
+  const matchesHTML = render2v2MatchesList(t);
+  const isKnockout = t.type === 'knockout';
+  const allDone = playedCount === t.matches.length && t.matches.length > 0;
+
+  const ranking = isKnockout ? rankByWins(standings) : standings;
+  const top = allDone ? ranking[0] : null;
+  const bottom = allDone ? ranking[ranking.length - 1] : null;
+
+  const headerBadge = top
+    ? (isKnockout
+        ? `<span class="label-pill green">🏆 ${escapeHtml(top.player)}</span>`
+        : `<span class="label-pill green">🥇 ${escapeHtml(top.player)}</span>`)
+    : '';
+
+  return `
+    <div class="grid lg:grid-cols-[1fr_1.4fr] gap-5">
+      <div class="card">
+        <div class="flex items-center justify-between flex-wrap gap-2">
+          <div>
+            <h3 class="section-title">${isKnockout ? 'Sıralama' : 'Turnir cədvəli'}</h3>
+            <p class="section-sub" id="playedCounter">${playedCount}/${t.matches.length} oyun oynandı</p>
+          </div>
+          ${headerBadge}
+        </div>
+        <div class="divider"></div>
+        <div class="overflow-x-auto">
+          <table class="standings-table">
+            <thead>
+              <tr>
+                <th class="pos">#</th>
+                <th class="player-cell" style="text-align:left;">Oyuncu</th>
+                <th title="Oynadığı">O</th>
+                <th title="Qalibiyyət">Q</th>
+                <th title="Heç-heçə">H</th>
+                <th title="Məğlubiyyət">M</th>
+                <th title="Vurulan">V</th>
+                <th title="Buraxılan">B</th>
+                <th title="Fərq">F</th>
+                ${isKnockout ? '' : '<th class="pts">XAL</th>'}
+              </tr>
+            </thead>
+            <tbody id="standingsBody">
+              ${renderStandingsRows(ranking, !isKnockout)}
+            </tbody>
+          </table>
+        </div>
+        ${isKnockout && bottom ? `
+          <div class="mt-4 p-3 rounded-lg bg-red-950/20 border border-red-900/40 flex items-center gap-3 text-sm">
+            <span class="text-lg">❌</span>
+            <span>Uduzan: <span class="font-semibold text-red-300">${escapeHtml(bottom.player)}</span> <span class="text-zinc-500">(${bottom.lost} məğlubiyyət, ${bottom.won} qalibiyyət)</span></span>
+          </div>
+        ` : ''}
+      </div>
+
+      <div class="card">
+        <h3 class="section-title">Oyunlar</h3>
+        <p class="section-sub">Hər oyunda komandalar random bölünüb. Hesabı yaz — sıralama avtomatik yenilənəcək.</p>
+        <div class="divider"></div>
+        ${matchesHTML}
+      </div>
+    </div>
+  `;
+}
+
+function rankByWins(standings) {
+  return [...standings].sort((a, b) =>
+    b.won - a.won ||
+    a.lost - b.lost ||
+    b.gd - a.gd ||
+    b.gf - a.gf ||
+    a.player.localeCompare(b.player, 'az')
+  );
+}
+
+// ─── Knockout (1v1) view ─────────────────────────────────────────────────────
 function renderKnockoutView(t) {
   const rounds = groupByRound(t.matches);
   const champion = knockoutChampion(t);
-  const is2v2 = t.format === '2v2';
-  const championLabel = champion ? (is2v2 ? teamLabel(champion) : champion) : null;
-
-  const teamsHeader = is2v2 && t.teams ? `
-    <div class="card-tight rounded-lg bg-zinc-900/50 border border-zinc-800 mb-4">
-      <div class="flex items-center justify-between flex-wrap gap-2">
-        <div class="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Komandalar</div>
-        ${t.reserve ? `<span class="text-xs text-amber-300/80">Ehtiyat: ${escapeHtml(t.reserve)}</span>` : ''}
-      </div>
-      <div class="mt-2 grid sm:grid-cols-2 gap-3">
-        ${t.teams.map((team, i) => `
-          <div class="flex items-start gap-2 text-sm">
-            <span class="text-xs font-bold text-zinc-500 w-5 mt-0.5">${i + 1}.</span>
-            <div class="flex flex-col gap-0.5 min-w-0">
-              <span class="font-semibold ${team.name && team.name.trim() ? 'text-emerald-300' : 'text-zinc-300'}">${escapeHtml(teamDisplayName(team, i + 1))}</span>
-              <span class="text-xs text-zinc-500">${(team.players || []).map(escapeHtml).join(' + ')}</span>
-            </div>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-  ` : '';
 
   return `
     <div class="card">
@@ -1288,18 +1134,17 @@ function renderKnockoutView(t) {
           <h3 class="section-title">Kubok cədvəli</h3>
           <p class="section-sub">Hər oyunda hesabı doldur, qalib avtomatik növbəti tura keçəcək.</p>
         </div>
-        ${championLabel ? `<span class="label-pill green">🏆 Çempion: ${escapeHtml(championLabel)}</span>` : ''}
+        ${champion ? `<span class="label-pill green">🏆 Çempion: ${escapeHtml(champion)}</span>` : ''}
       </div>
       <div class="divider"></div>
-      ${teamsHeader}
-      <div class="grid gap-5 md:gap-6 overflow-x-auto" style="grid-template-columns: repeat(${rounds.length}, minmax(${is2v2 ? '16rem' : '14rem'}, 1fr));">
+      <div class="grid gap-5 md:gap-6 overflow-x-auto" style="grid-template-columns: repeat(${rounds.length}, minmax(14rem, 1fr));">
         ${rounds.map(({ round, matches }, idx) => `
           <div>
             <div class="mb-3 flex items-center justify-center">
               <span class="label-pill zinc">${knockoutRoundLabel(idx, rounds.length)}</span>
             </div>
             <div class="grid gap-3" style="align-content: space-around; min-height: 100%;">
-              ${matches.map(m => is2v2 ? renderBracketMatch2v2(m) : renderBracketMatch(m)).join('')}
+              ${matches.map(m => renderBracketMatch(m)).join('')}
             </div>
           </div>
         `).join('')}
@@ -1335,51 +1180,6 @@ function renderBracketMatch(m) {
   `;
 }
 
-function renderBracketMatch2v2(m) {
-  const played = m.scoreA != null && m.scoreB != null;
-  const wA = m.winner && sameTeam(m.winner, m.teamA);
-  const wB = m.winner && sameTeam(m.winner, m.teamB);
-  const ready = m.teamA != null && m.teamB != null && !m.isBye;
-  const isBye = m.isBye;
-
-  const sideHTML = (team, score, side, win, lose, ph) => {
-    const isPlaceholder = team == null;
-    let content;
-    if (isPlaceholder) {
-      content = `<span class="ph truncate">${ph}</span>`;
-    } else {
-      const hasName = team.name && team.name.trim();
-      const players = team.players || [];
-      content = `
-        <div class="flex flex-col gap-0.5 min-w-0">
-          ${hasName ? `<span class="bracket-team-name truncate">${escapeHtml(team.name.trim())}</span>` : ''}
-          <div class="flex flex-col gap-0.5">
-            ${players.map(p => `<span class="inline-flex items-center gap-1.5 truncate"><span class="avatar-mini">${escapeHtml(initials(p))}</span><span class="truncate text-xs">${escapeHtml(p)}</span></span>`).join('')}
-          </div>
-        </div>
-      `;
-    }
-    return `
-      <div class="bracket-side bracket-side-team ${win ? 'win' : ''} ${lose ? 'lose' : ''}">
-        ${content}
-        ${ready ? `<input type="number" min="0" max="99" class="score-input" data-mid="${m.id}" data-side="${side}" value="${score ?? ''}" placeholder="–" />`
-          : (team != null ? `<span class="text-xs text-zinc-500">bye</span>` : '')}
-      </div>
-    `;
-  };
-
-  const ph1 = m.from ? `Qalib · ${m.from[0].slice(0, 4)}` : '—';
-  const ph2 = m.from ? `Qalib · ${m.from[1].slice(0, 4)}` : '—';
-
-  return `
-    <div class="bracket-match ${m.winner ? 'decided' : ''} ${isBye ? 'bye' : ''}" data-mid="${m.id}">
-      ${sideHTML(m.teamA, m.scoreA, 'A', wA, played && !wA, ph1)}
-      <div class="h-px bg-zinc-800"></div>
-      ${sideHTML(m.teamB, m.scoreB, 'B', wB, played && !wB, ph2)}
-    </div>
-  `;
-}
-
 // ─── Match input wiring ──────────────────────────────────────────────────────
 function bindMatchInputs(tournament) {
   $$('.score-input').forEach(input => {
@@ -1411,7 +1211,9 @@ function onScoreInput(tournament, input) {
   }
   saveState();
 
-  if (tournament.type === 'round-robin') {
+  // For both round-robin AND knockout 2v2, the standings/ranking refreshes live.
+  // Only 1v1 knockout uses the bracket-propagation path.
+  if (tournament.format === '2v2' || tournament.type === 'round-robin') {
     refreshStandingsLive(tournament);
     refreshMatchVisualState(tournament, m);
   }
@@ -1421,7 +1223,8 @@ function onScoreCommit(tournament, input) {
   const mid = input.dataset.mid;
   const m = tournament.matches.find(x => x.id === mid);
   if (!m) return;
-  if (tournament.type === 'knockout') {
+  // Only 1v1 knockout propagates winners through a bracket.
+  if (tournament.type === 'knockout' && tournament.format !== '2v2') {
     const prevWinner = m.winner;
     knockoutPropagate(tournament, m.id);
     saveState();
@@ -1433,7 +1236,10 @@ function onScoreCommit(tournament, input) {
 function refreshStandingsLive(tournament) {
   const tbody = $('#standingsBody');
   if (!tbody) return;
-  tbody.innerHTML = renderStandingsRows(computeStandings(tournament));
+  const isKnockout2v2 = tournament.format === '2v2' && tournament.type === 'knockout';
+  const standings = computeStandings(tournament);
+  const ranking = isKnockout2v2 ? rankByWins(standings) : standings;
+  tbody.innerHTML = renderStandingsRows(ranking, !isKnockout2v2);
 
   const playedCounter = $('#playedCounter');
   const playedCount = tournament.matches.filter(m => isMatchPlayed(tournament, m)).length;
@@ -1489,14 +1295,13 @@ function refreshBracketMatchState(m) {
   card.classList.toggle('decided', !!m.winner);
   const sides = card.querySelectorAll('.bracket-side');
   if (sides.length < 2) return;
-  const is2v2 = m.teamA !== undefined;
-  const played = is2v2 ? (m.scoreA != null && m.scoreB != null) : (m.score1 != null && m.score2 != null);
-  const wA = is2v2 ? (m.winner && sameTeam(m.winner, m.teamA)) : (m.winner && m.winner === m.player1);
-  const wB = is2v2 ? (m.winner && sameTeam(m.winner, m.teamB)) : (m.winner && m.winner === m.player2);
-  sides[0].classList.toggle('win', !!wA);
-  sides[0].classList.toggle('lose', played && !wA && !!m.winner);
-  sides[1].classList.toggle('win', !!wB);
-  sides[1].classList.toggle('lose', played && !wB && !!m.winner);
+  const played = m.score1 != null && m.score2 != null;
+  const w1 = m.winner && m.winner === m.player1;
+  const w2 = m.winner && m.winner === m.player2;
+  sides[0].classList.toggle('win', !!w1);
+  sides[0].classList.toggle('lose', played && !w1 && !!m.winner);
+  sides[1].classList.toggle('win', !!w2);
+  sides[1].classList.toggle('lose', played && !w2 && !!m.winner);
 }
 
 // ─── Init ────────────────────────────────────────────────────────────────────
