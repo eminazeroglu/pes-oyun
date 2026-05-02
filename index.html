@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="az">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PES Çempionat Bölgüsü</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="bg-zinc-950 text-zinc-100 antialiased min-h-screen">
+  <div class="min-h-screen flex flex-col">
+    <header class="border-b border-zinc-800/80 sticky top-0 bg-zinc-950/85 backdrop-blur z-20">
+      <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between gap-3">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-gradient-to-br from-emerald-500/30 to-emerald-600/10 ring-1 ring-emerald-500/30 flex items-center justify-center">
+            <span class="text-xl">⚽</span>
+          </div>
+          <div>
+            <h1 class="text-base font-bold leading-tight tracking-tight">PES Çempionat Bölgüsü</h1>
+            <p class="text-[11px] text-zinc-500 leading-tight">Oyuncuları və nəticələri izlə</p>
+          </div>
+        </div>
+        <nav class="flex items-center gap-1 text-sm" id="tabs">
+          <button data-tab="players" class="tab">Oyuncular</button>
+          <button data-tab="setup" class="tab">Yeni çempionat</button>
+          <button data-tab="active" class="tab">Cədvəl</button>
+        </nav>
+      </div>
+    </header>
+
+    <main class="max-w-6xl mx-auto w-full px-4 py-6 flex-1">
+      <section data-panel="players" class="panel"></section>
+      <section data-panel="setup" class="panel hidden"></section>
+      <section data-panel="active" class="panel hidden"></section>
+    </main>
+
+    <footer class="text-center text-[11px] text-zinc-600 pb-6 px-4">
+      Bütün məlumatlar yalnız sənin brauzerinin localStorage-ında saxlanılır.
+    </footer>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
